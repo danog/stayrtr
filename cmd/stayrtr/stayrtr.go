@@ -165,6 +165,152 @@ func decodeJSON(data []byte) (*prefixfile.RPKIList, error) {
 	return &rpkilistjson, err
 }
 
+// streamedUpdate holds the result of a streaming decode. When raw JSON
+// structures are not retained (no export or SLURM configured), the VRPJson and
+// BgpSecKeyJson fields stay nil and only the compact RTR form is kept.
+type streamedUpdate struct {
+	metadata prefixfile.MetaData
+	vrps     []rtr.VRP
+	brks     []rtr.BgpsecKey
+	countv4  int
+	countv6  int
+
+	vrpsjson []prefixfile.VRPJson
+	brksjson []prefixfile.BgpSecKeyJson
+
+	roasSeen   bool
+	bgpsecSeen bool
+}
+
+// decodeJSONStream decodes an RPKI list document element by element, converting
+// each entry to the compact RTR form as it is read. This avoids buffering the
+// whole document (which can exceed 100MB with gzip responses that carry no
+// usable Content-Length) and the double parse a preallocation pass would
+// otherwise need. The returned update is not sorted and deduplicated yet; use
+// sortAndDedupVRPs before serving.
+func decodeJSONStream(r io.Reader, sizeHint int64, retain bool) (*streamedUpdate, error) {
+	NowUnix := time.Now().Unix()
+	updt := &streamedUpdate{}
+	dec := json.NewDecoder(r)
+
+	tok, err := dec.Token()
+	if err != nil {
+		return nil, err
+	}
+	if delim, ok := tok.(json.Delim); !ok || delim != '{' {
+		return nil, fmt.Errorf("expected JSON object, got %v", tok)
+	}
+
+	for dec.More() {
+		keyTok, err := dec.Token()
+		if err != nil {
+			return nil, err
+		}
+		key, _ := keyTok.(string)
+		switch key {
+		case "metadata":
+			if err := dec.Decode(&updt.metadata); err != nil {
+				return nil, err
+			}
+		case "roas":
+			updt.roasSeen = true
+			if count := updt.metadata.Counts; count > 0 && count <= preallocLimit(sizeHint) {
+				updt.vrps = make([]rtr.VRP, 0, count)
+				if retain {
+					updt.vrpsjson = make([]prefixfile.VRPJson, 0, count)
+				}
+			}
+			if err := expectDelim(dec, '['); err != nil {
+				return nil, err
+			}
+			for dec.More() {
+				var v prefixfile.VRPJson
+				if err := dec.Decode(&v); err != nil {
+					return nil, err
+				}
+				if retain {
+					updt.vrpsjson = append(updt.vrpsjson, v)
+				}
+				if vrp, ok := convertVRP(v, NowUnix); ok {
+					if vrp.Prefix.Addr().Is4() {
+						updt.countv4++
+					} else {
+						updt.countv6++
+					}
+					updt.vrps = append(updt.vrps, vrp)
+				}
+			}
+			if err := expectDelim(dec, ']'); err != nil {
+				return nil, err
+			}
+		case "bgpsec_keys":
+			updt.bgpsecSeen = true
+			if count := updt.metadata.CountBgpSecKeys; count > 0 && count <= preallocLimit(sizeHint) && retain {
+				updt.brksjson = make([]prefixfile.BgpSecKeyJson, 0, count)
+			}
+			if err := expectDelim(dec, '['); err != nil {
+				return nil, err
+			}
+			for dec.More() {
+				var v prefixfile.BgpSecKeyJson
+				if err := dec.Decode(&v); err != nil {
+					return nil, err
+				}
+				if retain {
+					updt.brksjson = append(updt.brksjson, v)
+				}
+				if brk, ok := convertBRK(v, NowUnix); ok {
+					updt.brks = append(updt.brks, brk)
+				}
+			}
+			if err := expectDelim(dec, ']'); err != nil {
+				return nil, err
+			}
+		default:
+			var skip json.RawMessage
+			if err := dec.Decode(&skip); err != nil {
+				return nil, err
+			}
+		}
+	}
+	if _, err := dec.Token(); err != nil { // '}'
+		return nil, err
+	}
+
+	// json.Unmarshal rejects trailing data; keep the same strictness.
+	if _, err := dec.Token(); err == nil {
+		return nil, errors.New("unexpected data after JSON object")
+	} else if err != io.EOF {
+		return nil, err
+	}
+
+	return updt, nil
+}
+
+// preallocLimit bounds a metadata count used for slice preallocation, so a
+// bogus count cannot trigger a huge allocation.
+func preallocLimit(sizeHint int64) int {
+	if sizeHint > 0 {
+		return int(sizeHint/32) + 1024
+	}
+	return 8 << 20
+}
+
+func expectDelim(dec *json.Decoder, want json.Delim) error {
+	tok, err := dec.Token()
+	if err != nil {
+		return err
+	}
+	// A JSON null decodes as the untyped nil and behaves like an empty array.
+	if tok == nil {
+		return nil
+	}
+	if delim, ok := tok.(json.Delim); !ok || delim != want {
+		return fmt.Errorf("expected %v, got %v", want, tok)
+	}
+	return nil
+}
+
 func isValidPrefixLength(prefix netip.Prefix, maxLength uint8) bool {
 	plen := prefix.Bits()
 	max := prefix.Addr().BitLen()
@@ -175,63 +321,65 @@ func isValidPrefixLength(prefix netip.Prefix, maxLength uint8) bool {
 	return true
 }
 
-// processData will take a slice of prefix.VRPJson and attempt to convert them to a slice of rtr.VRP.
-// Will check the following:
-// 1 - The prefix is a valid prefix
-// 2 - The ASN is a valid ASN
-// 3 - The MaxLength is valid
-// Will return a deduped slice, as well as total VRPs, IPv4 VRPs, IPv6 VRPs and BGPsec Keys
-func processData(vrplistjson []prefixfile.VRPJson,
-	brklistjson []prefixfile.BgpSecKeyJson) /*Export*/ ([]rtr.VRP, []rtr.BgpsecKey, int, int) {
-	// It may be tempting to change this to a simple time.Since() but that will
-	// grab the current time every time it's invoked, time calls can be slow on
-	// some platforms, so lets just get the unix time when we start and use that
-	// to compare it all
-	NowUnix := time.Now().Unix()
-
-	vrplist := make([]rtr.VRP, 0, len(vrplistjson))
-	brklist := make([]rtr.BgpsecKey, 0, len(brklistjson))
-	var countv4 int
-	var countv6 int
-
-	for _, v := range vrplistjson {
-		prefix, err := v.GetPrefix2()
-		if err != nil {
-			log.Error(err)
-			continue
-		}
-		asn, err := v.GetASN2()
-		if err != nil {
-			log.Error(err)
-			continue
-		}
-
-		if !isValidPrefixLength(prefix, v.Length) {
-			continue
-		}
-
-		if v.Expires != nil {
-			// Prevent stale VRPs from being considered
-			// https://github.com/bgp/stayrtr/issues/15
-			if NowUnix > *v.Expires {
-				continue
-			}
-		}
-
-		if prefix.Addr().Is4() {
-			countv4++
-		} else {
-			countv6++
-		}
-
-		vrp := rtr.VRP{
-			Prefix: prefix,
-			ASN:    asn,
-			MaxLen: v.Length,
-		}
-		vrplist = append(vrplist, vrp)
+// convertVRP converts a single VRPJson entry to the compact RTR form. It
+// reports false for entries that are malformed, invalid or expired.
+func convertVRP(v prefixfile.VRPJson, nowUnix int64) (rtr.VRP, bool) {
+	prefix, err := v.GetPrefix2()
+	if err != nil {
+		log.Error(err)
+		return rtr.VRP{}, false
+	}
+	asn, err := v.GetASN2()
+	if err != nil {
+		log.Error(err)
+		return rtr.VRP{}, false
 	}
 
+	if !isValidPrefixLength(prefix, v.Length) {
+		return rtr.VRP{}, false
+	}
+
+	if v.Expires != nil {
+		// Prevent stale VRPs from being considered
+		// https://github.com/bgp/stayrtr/issues/15
+		if nowUnix > *v.Expires {
+			return rtr.VRP{}, false
+		}
+	}
+
+	return rtr.VRP{
+		Prefix: prefix,
+		ASN:    asn,
+		MaxLen: v.Length,
+	}, true
+}
+
+// convertBRK converts a single BgpSecKeyJson entry to the compact RTR form. It
+// reports false for entries that are malformed or expired.
+func convertBRK(v prefixfile.BgpSecKeyJson, nowUnix int64) (rtr.BgpsecKey, bool) {
+	if v.Expires != nil {
+		// Prevent stale VRPs from being considered
+		// https://github.com/bgp/stayrtr/issues/15
+		if nowUnix > *v.Expires {
+			return rtr.BgpsecKey{}, false
+		}
+	}
+
+	SKIBytes, err := hex.DecodeString(v.Ski)
+	if err != nil {
+		return rtr.BgpsecKey{}, false
+	}
+
+	return rtr.BgpsecKey{
+		ASN:    v.Asn,
+		Pubkey: v.Pubkey,
+		Ski:    SKIBytes,
+	}, true
+}
+
+// sortAndDedupVRPs sorts VRPs as per draft-ietf-sidrops-8210bis-10 and removes
+// duplicates in place.
+func sortAndDedupVRPs(vrplist []rtr.VRP) []rtr.VRP {
 	sort.Slice(vrplist, func(i, j int) bool {
 		// Sort VRPs as per draft-ietf-sidrops-8210bis-10
 		/*
@@ -277,27 +425,48 @@ func processData(vrplistjson []prefixfile.VRPJson,
 		vrplist[unique] = vrplist[i]
 		unique++
 	}
-	vrplist = vrplist[:unique]
+	return vrplist[:unique]
+}
 
-	for _, v := range brklistjson {
-		if v.Expires != nil {
-			// Prevent stale VRPs from being considered
-			// https://github.com/bgp/stayrtr/issues/15
-			if NowUnix > *v.Expires {
-				continue
-			}
-		}
+// processData will take a slice of prefix.VRPJson and attempt to convert them to a slice of rtr.VRP.
+// Will check the following:
+// 1 - The prefix is a valid prefix
+// 2 - The ASN is a valid ASN
+// 3 - The MaxLength is valid
+// Will return a deduped slice, as well as total VRPs, IPv4 VRPs, IPv6 VRPs and BGPsec Keys
+func processData(vrplistjson []prefixfile.VRPJson,
+	brklistjson []prefixfile.BgpSecKeyJson) /*Export*/ ([]rtr.VRP, []rtr.BgpsecKey, int, int) {
+	// It may be tempting to change this to a simple time.Since() but that will
+	// grab the current time every time it's invoked, time calls can be slow on
+	// some platforms, so lets just get the unix time when we start and use that
+	// to compare it all
+	NowUnix := time.Now().Unix()
 
-		SKIBytes, err := hex.DecodeString(v.Ski)
-		if err != nil {
+	vrplist := make([]rtr.VRP, 0, len(vrplistjson))
+	brklist := make([]rtr.BgpsecKey, 0, len(brklistjson))
+	var countv4 int
+	var countv6 int
+
+	for _, v := range vrplistjson {
+		vrp, ok := convertVRP(v, NowUnix)
+		if !ok {
 			continue
 		}
 
-		brklist = append(brklist, rtr.BgpsecKey{
-			ASN:    v.Asn,
-			Pubkey: v.Pubkey,
-			Ski:    SKIBytes,
-		})
+		if vrp.Prefix.Addr().Is4() {
+			countv4++
+		} else {
+			countv6++
+		}
+
+		vrplist = append(vrplist, vrp)
+	}
+	vrplist = sortAndDedupVRPs(vrplist)
+
+	for _, v := range brklistjson {
+		if brk, ok := convertBRK(v, NowUnix); ok {
+			brklist = append(brklist, brk)
+		}
 	}
 
 	return vrplist, brklist, countv4, countv6
@@ -313,8 +482,41 @@ func (e IdenticalFile) Error() string {
 
 var errRPKIJsonFileTooOld = errors.New("RPKI JSON file is older than 24 hours")
 
+// checkBuildTime enforces the 24 hour staleness check on the given metadata
+// when enabled via -checktime.
+func (s *state) checkBuildTime(metadata prefixfile.MetaData) error {
+	buildtime, err := time.Parse(time.RFC3339, metadata.Buildtime)
+	if metadata.GeneratedUnix != nil {
+		buildtime, err = time.Unix(*metadata.GeneratedUnix, 0), nil
+	}
+	if !s.checktime {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	notafter := buildtime.Add(time.Hour * 24)
+	if time.Now().UTC().After(notafter) {
+		log.Warnf("RPKI JSON file is older than 24 hours: %v", buildtime)
+		return errRPKIJsonFileTooOld
+	}
+	return nil
+}
+
 // Update the state based on the current slurm file and data.
 func (s *state) updateFromNewState() error {
+	if s.pending != nil {
+		updt := s.pending
+		s.pending = nil
+		if err := s.checkBuildTime(updt.metadata); err != nil {
+			return err
+		}
+		vrps := sortAndDedupVRPs(updt.vrps)
+		count := len(vrps) + len(updt.brks)
+		log.Infof("New update (%v uniques, %v total prefixes, %v router keys).", len(vrps), count, len(updt.brks))
+		return s.applyUpdateFromNewState(vrps, updt.brks, updt.vrpsjson, updt.brksjson, updt.countv4, updt.countv6)
+	}
+
 	vrpsjson := s.lastdata.ROA
 	if vrpsjson == nil {
 		return nil
@@ -325,19 +527,8 @@ func (s *state) updateFromNewState() error {
 		bgpsecjson = make([]prefixfile.BgpSecKeyJson, 0)
 	}
 
-	buildtime, err := time.Parse(time.RFC3339, s.lastdata.Metadata.Buildtime)
-	if s.lastdata.Metadata.GeneratedUnix != nil {
-		buildtime, err = time.Unix(*s.lastdata.Metadata.GeneratedUnix, 0), nil
-	}
-	if s.checktime {
-		if err != nil {
-			return err
-		}
-		notafter := buildtime.Add(time.Hour * 24)
-		if time.Now().UTC().After(notafter) {
-			log.Warnf("RPKI JSON file is older than 24 hours: %v", buildtime)
-			return errRPKIJsonFileTooOld
-		}
+	if err := s.checkBuildTime(s.lastdata.Metadata); err != nil {
+		return err
 	}
 
 	if s.slurm != nil {
@@ -362,19 +553,8 @@ func (s *state) reloadFromCurrentState() error {
 		bgpsecjson = make([]prefixfile.BgpSecKeyJson, 0)
 	}
 
-	buildtime, err := time.Parse(time.RFC3339, s.lastdata.Metadata.Buildtime)
-	if s.lastdata.Metadata.GeneratedUnix != nil {
-		buildtime, err = time.Unix(*s.lastdata.Metadata.GeneratedUnix, 0), nil
-	}
-	if s.checktime {
-		if err != nil {
-			return err
-		}
-		notafter := buildtime.Add(time.Hour * 24)
-		if time.Now().UTC().After(notafter) {
-			log.Warnf("RPKI JSON file is older than 24 hours: %v", buildtime)
-			return errRPKIJsonFileTooOld
-		}
+	if err := s.checkBuildTime(s.lastdata.Metadata); err != nil {
+		return err
 	}
 
 	if s.slurm != nil {
@@ -457,10 +637,11 @@ func (s *state) updateFile(file string) (bool, error) {
 	log.Debugf("Refreshing cache from %s", file)
 
 	s.lastts = time.Now().UTC()
-	data, code, lastrefresh, err := s.fetchConfig.FetchFile(file)
+	stream, code, lastrefresh, err := s.fetchConfig.FetchFileStream(file)
 	if err != nil {
 		return false, err
 	}
+	defer stream.Close()
 	if lastrefresh {
 		server_metrics.LastRefresh.WithLabelValues(file).Set(float64(s.lastts.UnixNano() / 1e9))
 	}
@@ -468,24 +649,43 @@ func (s *state) updateFile(file string) (bool, error) {
 		server_metrics.RefreshStatusCode.WithLabelValues(file, fmt.Sprintf("%d", code)).Inc()
 	}
 
-	hsum := newSHA256(data)
-	if s.lasthashCache != nil {
-		cres := bytes.Compare(s.lasthashCache, hsum)
-		if cres == 0 {
-			return false, IdenticalFile{File: file}
-		}
+	// Raw JSON structures are only needed when the export endpoint or SLURM
+	// filtering consumes them; otherwise entries are converted to the compact
+	// RTR form while streaming and released immediately.
+	retain := s.exportEnabled || s.slurm != nil
+
+	hasher := sha256.New()
+	updt, err := decodeJSONStream(io.TeeReader(stream, hasher), stream.SizeHint, retain)
+	if err != nil {
+		return false, err
+	}
+
+	// The hash of the complete document is only known once the stream has been
+	// consumed, so identical documents are detected after decoding rather than
+	// before it. Decoding is cheap compared to buffering the document twice.
+	hsum := hasher.Sum(nil)
+	if s.lasthashCache != nil && bytes.Equal(s.lasthashCache, hsum) {
+		return false, IdenticalFile{File: file}
 	}
 
 	log.Debugf("new cache file: Updating sha256 hash %x -> %x", s.lasthashCache, hsum)
 	s.lasthashCache = hsum
 
-	rpkilistjson, err := decodeJSON(data)
-	if err != nil {
-		return false, err
-	}
-
 	s.lastchange = time.Now().UTC()
-	s.lastdata = rpkilistjson
+	s.lastdata = &prefixfile.RPKIList{Metadata: updt.metadata}
+	if retain {
+		if updt.roasSeen {
+			s.lastdata.ROA = updt.vrpsjson
+			if s.lastdata.ROA == nil {
+				s.lastdata.ROA = make([]prefixfile.VRPJson, 0)
+			}
+		}
+		if updt.bgpsecSeen {
+			s.lastdata.BgpSecKeys = updt.brksjson
+		}
+	} else if updt.roasSeen {
+		s.pending = updt
+	}
 
 	return true, nil
 }
@@ -735,6 +935,7 @@ func (s *state) TriggerUpdate() bool {
 
 type state struct {
 	lastdata      *prefixfile.RPKIList
+	pending       *streamedUpdate
 	lasthashCache []byte
 	lasthashSlurm []byte
 	lastchange    time.Time

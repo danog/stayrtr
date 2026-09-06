@@ -1,18 +1,21 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
 	"os"
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
 
 	rtr "github.com/bgp/stayrtr/lib"
 	"github.com/bgp/stayrtr/prefixfile"
+	"github.com/bgp/stayrtr/utils"
 	"github.com/google/go-cmp/cmp"
 )
 
@@ -297,6 +300,151 @@ func TestUpdateReleasesSourceDataWhenUnused(t *testing.T) {
 	}
 	if s.lastdata.ROA != nil || s.lastdata.BgpSecKeys != nil {
 		t.Fatal("decoded source data was retained with export and SLURM disabled")
+	}
+	if got := server.CountSDs(); got != 1 {
+		t.Fatalf("RTR state contains %d objects, want 1", got)
+	}
+}
+
+func TestDecodeJSONStreamMatchesUnmarshal(t *testing.T) {
+	data, err := os.ReadFile("test.rpki.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	prefixComparer := cmp.Comparer(func(x, y netip.Prefix) bool { return x == y })
+
+	wantList, err := decodeJSON(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantVrps, wantBrks, wantV4, wantV6 := processData(wantList.ROA, wantList.BgpSecKeys)
+
+	got, err := decodeJSONStream(bytes.NewReader(data), int64(len(data)), true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cmp.Equal(wantList.Metadata, got.metadata) {
+		t.Fatalf("metadata mismatch (-want +got):\n%s", cmp.Diff(wantList.Metadata, got.metadata))
+	}
+	if !cmp.Equal(wantList.ROA, got.vrpsjson) {
+		t.Fatalf("retained ROAs mismatch (-want +got):\n%s", cmp.Diff(wantList.ROA, got.vrpsjson))
+	}
+	if !cmp.Equal(wantList.BgpSecKeys, got.brksjson) {
+		t.Fatalf("retained BGPsec keys mismatch (-want +got):\n%s", cmp.Diff(wantList.BgpSecKeys, got.brksjson))
+	}
+	if !cmp.Equal(wantVrps, sortAndDedupVRPs(got.vrps), prefixComparer) {
+		t.Fatalf("VRPs mismatch (-want +got):\n%s", cmp.Diff(wantVrps, got.vrps, prefixComparer))
+	}
+	if !cmp.Equal(wantBrks, got.brks) {
+		t.Fatalf("BGPsec keys mismatch (-want +got):\n%s", cmp.Diff(wantBrks, got.brks))
+	}
+	if got.countv4 != wantV4 || got.countv6 != wantV6 {
+		t.Fatalf("got counts v4=%d v6=%d, want v4=%d v6=%d", got.countv4, got.countv6, wantV4, wantV6)
+	}
+}
+
+func TestDecodeJSONStreamWithoutRetention(t *testing.T) {
+	data, err := os.ReadFile("test.rpki.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	prefixComparer := cmp.Comparer(func(x, y netip.Prefix) bool { return x == y })
+
+	retained, err := decodeJSONStream(bytes.NewReader(data), int64(len(data)), true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := decodeJSONStream(bytes.NewReader(data), int64(len(data)), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.vrpsjson != nil || got.brksjson != nil {
+		t.Fatal("non-retaining decode kept raw JSON structures")
+	}
+	if !cmp.Equal(retained.vrps, got.vrps, prefixComparer) {
+		t.Fatal("non-retaining decode produced different VRPs")
+	}
+	if !cmp.Equal(retained.brks, got.brks) {
+		t.Fatal("non-retaining decode produced different BGPsec keys")
+	}
+}
+
+func TestUpdateFileEmptyObjectIsNoop(t *testing.T) {
+	dir := t.TempDir()
+	doc := `{"metadata":{"vrps":2},"roas":[
+		{"prefix":"192.0.2.0/24","maxLength":24,"asn":"AS64496"},
+		{"prefix":"2001:db8::/32","maxLength":48,"asn":"AS64497"}]}`
+	empty := filepath.Join(dir, "empty.json")
+	if err := os.WriteFile(empty, []byte("{}"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cache := filepath.Join(dir, "cache.json")
+	if err := os.WriteFile(cache, []byte(doc), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	server := rtr.NewServer(rtr.ServerConfiguration{KeepDifference: 3}, nil, nil)
+	s := state{
+		server:      server,
+		lastdata:    &prefixfile.RPKIList{},
+		lockJson:    &sync.RWMutex{},
+		fetchConfig: utils.NewFetchConfig(),
+	}
+
+	if updated, err := s.updateFile(cache); err != nil || !updated {
+		t.Fatalf("updateFile: updated=%v err=%v", updated, err)
+	}
+	if err := s.updateFromNewState(); err != nil {
+		t.Fatal(err)
+	}
+	if got := server.CountSDs(); got != 2 {
+		t.Fatalf("RTR state contains %d objects, want 2", got)
+	}
+
+	// An empty object carries no roas key and must leave the current state alone.
+	if updated, err := s.updateFile(empty); err != nil || !updated {
+		t.Fatalf("updateFile empty: updated=%v err=%v", updated, err)
+	}
+	if s.pending != nil {
+		t.Fatal("empty object produced a pending update")
+	}
+	if err := s.updateFromNewState(); err != nil {
+		t.Fatal(err)
+	}
+	if got := server.CountSDs(); got != 2 {
+		t.Fatalf("empty object wiped the state: %d objects remain", got)
+	}
+}
+
+func TestUpdateFileRetainsJSONForExport(t *testing.T) {
+	dir := t.TempDir()
+	doc := `{"metadata":{"vrps":1},"roas":[{"prefix":"192.0.2.0/24","maxLength":24,"asn":"AS64496"}]}`
+	cache := filepath.Join(dir, "cache.json")
+	if err := os.WriteFile(cache, []byte(doc), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	server := rtr.NewServer(rtr.ServerConfiguration{KeepDifference: 3}, nil, nil)
+	s := state{
+		server:           server,
+		lastdata:         &prefixfile.RPKIList{},
+		lockJson:         &sync.RWMutex{},
+		exportEnabled:    true,
+		retainSourceData: true,
+		fetchConfig:      utils.NewFetchConfig(),
+	}
+
+	if updated, err := s.updateFile(cache); err != nil || !updated {
+		t.Fatalf("updateFile: updated=%v err=%v", updated, err)
+	}
+	if s.pending != nil {
+		t.Fatal("retain mode produced a pending update")
+	}
+	if len(s.lastdata.ROA) != 1 {
+		t.Fatalf("export mode retained %d raw ROAs, want 1", len(s.lastdata.ROA))
+	}
+	if err := s.updateFromNewState(); err != nil {
+		t.Fatal(err)
 	}
 	if got := server.CountSDs(); got != 1 {
 		t.Fatalf("RTR state contains %d objects, want 1", got)
