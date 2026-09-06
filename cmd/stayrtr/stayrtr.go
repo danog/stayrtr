@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"crypto/sha256"
 	"crypto/tls"
@@ -10,10 +11,13 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"net/http"
+	"net/http/pprof"
 	"net/netip"
 	"os"
 	"os/signal"
+	runtimepprof "runtime/pprof"
 	"sort"
 	"strings"
 	"sync"
@@ -52,6 +56,7 @@ var (
 
 	MetricsAddr = flag.String("metrics.addr", ":9847", "Metrics address")
 	MetricsPath = flag.String("metrics.path", "/metrics", "Metrics path")
+	EnablePprof = flag.Bool("pprof", false, "Enable pprof handlers under /debug/pprof/ on the metrics HTTP server")
 
 	ExportPath           = flag.String("export.path", "/rpki.json", "Export path")
 	EnableUpdateEndpoint = flag.Bool("update.endpoint", false, "Enable HTTP endpoint that expedites the next fetch")
@@ -117,6 +122,19 @@ func serveHTTP(mux *http.ServeMux) {
 	log.Fatal(srv.ListenAndServe())
 }
 
+func registerPprofHandlers(mux *http.ServeMux) {
+	mux.HandleFunc("GET /debug/pprof/", pprof.Index)
+	mux.HandleFunc("GET /debug/pprof/cmdline", pprof.Cmdline)
+	mux.HandleFunc("GET /debug/pprof/profile", pprof.Profile)
+	mux.HandleFunc("GET /debug/pprof/symbol", pprof.Symbol)
+	mux.HandleFunc("POST /debug/pprof/symbol", pprof.Symbol)
+	mux.HandleFunc("GET /debug/pprof/trace", pprof.Trace)
+
+	for _, profile := range runtimepprof.Profiles() {
+		mux.Handle("GET /debug/pprof/"+profile.Name(), pprof.Handler(profile.Name()))
+	}
+}
+
 // newSHA256 will return the sha256 sum of the byte slice
 // The return will be converted form a [32]byte to []byte
 func newSHA256(data []byte) []byte {
@@ -125,11 +143,25 @@ func newSHA256(data []byte) []byte {
 }
 
 func decodeJSON(data []byte) (*prefixfile.RPKIList, error) {
-	buf := bytes.NewBuffer(data)
-	dec := json.NewDecoder(buf)
+	// The metadata count lets encoding/json allocate the final ROA slice once
+	// instead of repeatedly growing a million-entry slice. Decode directly from
+	// data as well: using json.Decoder here would build another large buffer even
+	// though the complete input is already resident in memory.
+	var envelope struct {
+		Metadata prefixfile.MetaData `json:"metadata"`
+	}
+	if err := json.Unmarshal(data, &envelope); err != nil {
+		return nil, err
+	}
 
 	var rpkilistjson prefixfile.RPKIList
-	err := dec.Decode(&rpkilistjson)
+	if count := envelope.Metadata.Counts; count > 0 && count <= len(data) {
+		rpkilistjson.ROA = make([]prefixfile.VRPJson, 0, count)
+	}
+	if count := envelope.Metadata.CountBgpSecKeys; count > 0 && count <= len(data) {
+		rpkilistjson.BgpSecKeys = make([]prefixfile.BgpSecKeyJson, 0, count)
+	}
+	err := json.Unmarshal(data, &rpkilistjson)
 	return &rpkilistjson, err
 }
 
@@ -151,16 +183,14 @@ func isValidPrefixLength(prefix netip.Prefix, maxLength uint8) bool {
 // Will return a deduped slice, as well as total VRPs, IPv4 VRPs, IPv6 VRPs and BGPsec Keys
 func processData(vrplistjson []prefixfile.VRPJson,
 	brklistjson []prefixfile.BgpSecKeyJson) /*Export*/ ([]rtr.VRP, []rtr.BgpsecKey, int, int) {
-	filterDuplicates := make(map[string]struct{})
-
 	// It may be tempting to change this to a simple time.Since() but that will
 	// grab the current time every time it's invoked, time calls can be slow on
 	// some platforms, so lets just get the unix time when we start and use that
 	// to compare it all
 	NowUnix := time.Now().Unix()
 
-	var vrplist []rtr.VRP
-	var brklist = make([]rtr.BgpsecKey, 0)
+	vrplist := make([]rtr.VRP, 0, len(vrplistjson))
+	brklist := make([]rtr.BgpsecKey, 0, len(brklistjson))
 	var countv4 int
 	var countv6 int
 
@@ -194,13 +224,6 @@ func processData(vrplistjson []prefixfile.VRPJson,
 			countv6++
 		}
 
-		key := fmt.Sprintf("%s,%d,%d", prefix, asn, v.Length)
-		_, exists := filterDuplicates[key]
-		if exists {
-			continue
-		}
-		filterDuplicates[key] = struct{}{}
-
 		vrp := rtr.VRP{
 			Prefix: prefix,
 			ASN:    asn,
@@ -230,15 +253,31 @@ func processData(vrplistjson []prefixfile.VRPJson,
 				sub-prefix P1 before the covering prefix P0.
 		*/
 
-		if vrplist[i].Prefix.Bits() == vrplist[j].Prefix.Bits() {
-			if vrplist[i].MaxLen != vrplist[j].MaxLen {
-				return vrplist[i].MaxLen > vrplist[j].MaxLen
-			}
-			return vrplist[i].Prefix.Addr().Compare(vrplist[j].Prefix.Addr()) < 1
-		} else {
+		if vrplist[i].Prefix.Bits() != vrplist[j].Prefix.Bits() {
 			return vrplist[i].Prefix.Bits() > vrplist[j].Prefix.Bits()
 		}
+		if vrplist[i].MaxLen != vrplist[j].MaxLen {
+			return vrplist[i].MaxLen > vrplist[j].MaxLen
+		}
+		if addressOrder := vrplist[i].Prefix.Addr().Compare(vrplist[j].Prefix.Addr()); addressOrder != 0 {
+			return addressOrder < 0
+		}
+		return vrplist[i].ASN < vrplist[j].ASN
 	})
+
+	// Sorting places identical VRPs next to one another, so they can be
+	// removed in place without retaining a second million-entry hash map.
+	unique := 0
+	for i := range vrplist {
+		if unique > 0 && vrplist[i].Prefix == vrplist[unique-1].Prefix &&
+			vrplist[i].MaxLen == vrplist[unique-1].MaxLen &&
+			vrplist[i].ASN == vrplist[unique-1].ASN {
+			continue
+		}
+		vrplist[unique] = vrplist[i]
+		unique++
+	}
+	vrplist = vrplist[:unique]
 
 	for _, v := range brklistjson {
 		if v.Expires != nil {
@@ -280,6 +319,7 @@ func (s *state) updateFromNewState() error {
 	if vrpsjson == nil {
 		return nil
 	}
+	defer s.releaseSourceData()
 	bgpsecjson := s.lastdata.BgpSecKeys
 	if bgpsecjson == nil {
 		bgpsecjson = make([]prefixfile.BgpSecKeyJson, 0)
@@ -355,35 +395,37 @@ func (s *state) applyUpdateFromNewState(vrps []rtr.VRP, brks []rtr.BgpsecKey,
 	countv4 int, countv6 int) error {
 
 	SDs := make([]rtr.SendableData, 0, len(vrps)+len(brks))
-	for _, v := range vrps {
-		SDs = append(SDs, v.Copy())
+	for i := range vrps {
+		SDs = append(SDs, &vrps[i])
 	}
-	for _, v := range brks {
-		SDs = append(SDs, v.Copy())
+	for i := range brks {
+		SDs = append(SDs, &brks[i])
 	}
-	if !s.server.AddData(SDs) {
+	changed := s.server.AddData(SDs)
+	if !changed {
 		log.Info("No difference to current cache")
-		return nil
+	} else {
+		serial, _ := s.server.GetCurrentSerial()
+		log.Infof("Update added, new serial %v", serial)
+		if s.sendNotifs {
+			log.Debugf("Sending notifications to clients")
+			s.server.NotifyClientsLatest()
+		}
+		server_metrics.CurrentSerial.Set(float64(serial))
 	}
 
-	serial, _ := s.server.GetCurrentSerial()
-	log.Infof("Update added, new serial %v", serial)
-	if s.sendNotifs {
-		log.Debugf("Sending notifications to clients")
-		s.server.NotifyClientsLatest()
+	if s.exportEnabled {
+		s.lockJson.Lock()
+		s.exported = prefixfile.RPKIList{
+			Metadata: prefixfile.MetaData{
+				Counts:    len(vrpsjson),
+				Buildtime: s.lastdata.Metadata.Buildtime,
+			},
+			ROA:        vrpsjson,
+			BgpSecKeys: brksjson,
+		}
+		s.lockJson.Unlock()
 	}
-	server_metrics.CurrentSerial.Set(float64(serial))
-
-	s.lockJson.Lock()
-	s.exported = prefixfile.RPKIList{
-		Metadata: prefixfile.MetaData{
-			Counts:    len(vrpsjson),
-			Buildtime: s.lastdata.Metadata.Buildtime,
-		},
-		ROA:        vrpsjson,
-		BgpSecKeys: brksjson,
-	}
-	s.lockJson.Unlock()
 
 	if s.metricsEvent != nil {
 		var countv4_dup int
@@ -399,6 +441,16 @@ func (s *state) applyUpdateFromNewState(vrps []rtr.VRP, brks []rtr.BgpsecKey,
 	}
 
 	return nil
+}
+
+// releaseSourceData drops the decoded JSON once the compact RTR state has been
+// built. Raw source data is only needed for JSON export or future SLURM reloads.
+func (s *state) releaseSourceData() {
+	if s.retainSourceData || s.lastdata == nil {
+		return
+	}
+	s.lastdata.ROA = nil
+	s.lastdata.BgpSecKeys = nil
 }
 
 func (s *state) updateFile(file string) (bool, error) {
@@ -482,7 +534,7 @@ func (s *state) updateDelay(delay *time.Ticker, interval int) {
 func (s *state) errRPKIJsonFileTooOldHandler() {
 	// If the exiting build time is over 24 hours, It's time to drop everything out.
 	// to avoid routing on stale data
-	buildTime := s.exported.Metadata.GetBuildTime()
+	buildTime := s.lastdata.Metadata.GetBuildTime()
 	if !buildTime.IsZero() && time.Since(buildTime) > time.Hour*24 {
 		log.Errorf("Data is stale, clearing it all.")
 		s.server.AddData([]rtr.SendableData{}) // empty the store of sendable stuff, triggering a emptying of the RTR server
@@ -583,8 +635,74 @@ func (s *state) exporter(wr http.ResponseWriter, r *http.Request) {
 	s.lockJson.RLock()
 	toExport := s.exported
 	s.lockJson.RUnlock()
-	enc := json.NewEncoder(wr)
-	enc.Encode(toExport)
+
+	wr.Header().Set("Content-Type", "application/json")
+	buf := bufio.NewWriterSize(wr, 64*1024)
+	if err := writeRPKIList(buf, &toExport); err != nil {
+		log.Errorf("Could not export RPKI JSON: %v", err)
+		return
+	}
+	if err := buf.Flush(); err != nil {
+		log.Errorf("Could not flush RPKI JSON: %v", err)
+	}
+}
+
+const exportChunkSize = 1024
+
+func writeRPKIList(w io.Writer, list *prefixfile.RPKIList) error {
+	metadata, err := json.Marshal(list.Metadata)
+	if err != nil {
+		return err
+	}
+	if _, err := io.WriteString(w, `{"metadata":`); err != nil {
+		return err
+	}
+	if _, err := w.Write(metadata); err != nil {
+		return err
+	}
+	if _, err := io.WriteString(w, `,"roas":`); err != nil {
+		return err
+	}
+	if err := writeJSONArrayChunks(w, list.ROA); err != nil {
+		return err
+	}
+	if len(list.BgpSecKeys) > 0 {
+		if _, err := io.WriteString(w, `,"bgpsec_keys":`); err != nil {
+			return err
+		}
+		if err := writeJSONArrayChunks(w, list.BgpSecKeys); err != nil {
+			return err
+		}
+	}
+	_, err = io.WriteString(w, "}\n")
+	return err
+}
+
+func writeJSONArrayChunks[T any](w io.Writer, values []T) error {
+	if values == nil {
+		_, err := io.WriteString(w, "null")
+		return err
+	}
+	if _, err := io.WriteString(w, "["); err != nil {
+		return err
+	}
+	for start := 0; start < len(values); start += exportChunkSize {
+		end := min(start+exportChunkSize, len(values))
+		chunk, err := json.Marshal(values[start:end])
+		if err != nil {
+			return err
+		}
+		if start > 0 {
+			if _, err := io.WriteString(w, ","); err != nil {
+				return err
+			}
+		}
+		if _, err := w.Write(chunk[1 : len(chunk)-1]); err != nil {
+			return err
+		}
+	}
+	_, err := io.WriteString(w, "]")
+	return err
 }
 
 func (s *state) updateNow(wr http.ResponseWriter, r *http.Request) {
@@ -629,8 +747,10 @@ type state struct {
 
 	metricsEvent *metricsEvent
 
-	exported prefixfile.RPKIList
-	lockJson *sync.RWMutex
+	exported         prefixfile.RPKIList
+	lockJson         *sync.RWMutex
+	exportEnabled    bool
+	retainSourceData bool
 
 	slurm *prefixfile.SlurmConfig
 
@@ -735,12 +855,14 @@ func run() error {
 	deh.SetSDManager(server)
 
 	s := state{
-		server:       server,
-		lastdata:     &prefixfile.RPKIList{},
-		metricsEvent: me,
-		sendNotifs:   *SendNotifs,
-		checktime:    *TimeCheck,
-		lockJson:     &sync.RWMutex{},
+		server:           server,
+		lastdata:         &prefixfile.RPKIList{},
+		metricsEvent:     me,
+		sendNotifs:       *SendNotifs,
+		checktime:        *TimeCheck,
+		lockJson:         &sync.RWMutex{},
+		exportEnabled:    *ExportPath != "",
+		retainSourceData: *ExportPath != "" || (*Slurm != "" && *SlurmRefresh),
 
 		fetchConfig: utils.NewFetchConfig(),
 
@@ -759,6 +881,9 @@ func run() error {
 		mux := http.NewServeMux()
 		mux.Handle(*MetricsPath, promhttp.Handler())
 		mux.HandleFunc("GET /clients", server.GetClientRemoteAddrs)
+		if *EnablePprof {
+			registerPprofHandlers(mux)
+		}
 
 		if *ExportPath != "" {
 			mux.HandleFunc(*ExportPath, s.exporter)

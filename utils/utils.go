@@ -50,6 +50,7 @@ func (e IdenticalEtag) Error() string {
 func (c *FetchConfig) FetchFile(file string) ([]byte, int, bool, error) {
 	var f io.Reader
 	var err error
+	sizeHint := int64(-1)
 	if len(file) > 8 && (file[0:7] == "http://" || file[0:8] == "https://") {
 
 		// Copying base of DefaultTransport from https://golang.org/src/net/http/transport.go
@@ -132,6 +133,7 @@ func (c *FetchConfig) FetchFile(file string) ([]byte, int, bool, error) {
 		//LastRefresh.WithLabelValues(file).Set(float64(s.lastts.UnixNano() / 1e9))
 
 		f = fhttp.Body
+		sizeHint = fhttp.ContentLength
 
 		newEtag := fhttp.Header.Get("ETag")
 
@@ -159,14 +161,46 @@ func (c *FetchConfig) FetchFile(file string) ([]byte, int, bool, error) {
 			c.conditionalRequestLock.Unlock()
 		}
 	} else {
-		f, err = os.Open(file)
+		localFile, err := os.Open(file)
 		if err != nil {
 			return nil, -1, false, err
 		}
+		defer localFile.Close()
+		f = localFile
+		if stat, statErr := localFile.Stat(); statErr == nil {
+			sizeHint = stat.Size()
+		}
 	}
-	data, err := io.ReadAll(f)
+	data, err := readAllWithSizeHint(f, sizeHint)
 	if err != nil {
 		return nil, -1, false, err
 	}
 	return data, -1, false, nil
+}
+
+func readAllWithSizeHint(r io.Reader, sizeHint int64) ([]byte, error) {
+	maxInt := uint64(^uint(0) >> 1)
+	if sizeHint <= 0 || uint64(sizeHint) > maxInt {
+		return io.ReadAll(r)
+	}
+
+	data := make([]byte, int(sizeHint))
+	if _, err := io.ReadFull(r, data); err != nil {
+		return nil, err
+	}
+
+	// Content-Length and regular-file sizes should be exact. Preserve correct
+	// behavior if a reader grows after the size was observed.
+	var extra [1]byte
+	n, err := r.Read(extra[:])
+	if err == io.EOF {
+		return data, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	tail, err := io.ReadAll(r)
+	data = append(data, extra[:n]...)
+	data = append(data, tail...)
+	return data, err
 }

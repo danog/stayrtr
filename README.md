@@ -263,6 +263,11 @@ $ ./rtrdump -connect 127.0.0.1:8282 -file debug.json
 
 You can also fetch the re-generated JSON from the `-export.path` endpoint (default: `http://localhost:9847/rpki.json`)
 
+For runtime profiling, `-pprof` enables the Go pprof endpoints under
+`/debug/pprof/` on the metrics HTTP listener. These endpoints can expose
+sensitive process details and should only be enabled on a trusted network or
+behind access controls.
+
 ## Monitoring rtr and JSON endpoints
 
 With `rtrmon` you can monitor the difference between rtr and/or JSON endpoints.

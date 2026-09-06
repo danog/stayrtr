@@ -235,25 +235,130 @@ func ConvertSDListToMap(SDs []SendableData) map[string]uint8 {
 	return sdMap
 }
 
+// vrpMapKey keeps the common VRP case entirely comparable without converting
+// prefixes and integers to formatted strings. addrBits distinguishes IPv4
+// addresses from IPv4-mapped IPv6 addresses.
+type vrpMapKey struct {
+	addr       [16]byte
+	asn        uint32
+	prefixBits uint8
+	addrBits   uint8
+	maxLen     uint8
+}
+
+type sendableDataIndex struct {
+	vrps  map[vrpMapKey]uint8
+	other map[string]uint8
+}
+
+func getVRPMapKey(item SendableData) (vrpMapKey, bool) {
+	vrp, ok := item.(*VRP)
+	if !ok || !vrp.Prefix.IsValid() {
+		return vrpMapKey{}, false
+	}
+	return vrpMapKey{
+		addr:       vrp.Prefix.Addr().As16(),
+		asn:        vrp.ASN,
+		prefixBits: uint8(vrp.Prefix.Bits()),
+		addrBits:   uint8(vrp.Prefix.Addr().BitLen()),
+		maxLen:     vrp.MaxLen,
+	}, true
+}
+
+func newSendableDataIndex(items []SendableData) *sendableDataIndex {
+	vrpCount := 0
+	for _, item := range items {
+		if _, ok := getVRPMapKey(item); ok {
+			vrpCount++
+		}
+	}
+
+	index := &sendableDataIndex{}
+	if vrpCount > 0 {
+		index.vrps = make(map[vrpMapKey]uint8, vrpCount)
+	}
+	if otherCount := len(items) - vrpCount; otherCount > 0 {
+		index.other = make(map[string]uint8, otherCount)
+	}
+	for _, item := range items {
+		index.set(item, item.GetFlag())
+	}
+	return index
+}
+
+func (index *sendableDataIndex) get(item SendableData) (uint8, bool) {
+	if key, ok := getVRPMapKey(item); ok {
+		value, exists := index.vrps[key]
+		return value, exists
+	}
+	value, exists := index.other[item.HashKey()]
+	return value, exists
+}
+
+func (index *sendableDataIndex) set(item SendableData, value uint8) {
+	if key, ok := getVRPMapKey(item); ok {
+		if index.vrps == nil {
+			index.vrps = make(map[vrpMapKey]uint8)
+		}
+		index.vrps[key] = value
+		return
+	}
+	if index.other == nil {
+		index.other = make(map[string]uint8)
+	}
+	index.other[item.HashKey()] = value
+}
+
+func (index *sendableDataIndex) add(item SendableData, value uint8) {
+	current, _ := index.get(item)
+	index.set(item, current|value)
+}
+
 func ComputeDiff(newSDs, prevSDs []SendableData, populateUnchanged bool) (added, removed, unchanged []SendableData) {
 	added = make([]SendableData, 0)
 	removed = make([]SendableData, 0)
 	unchanged = make([]SendableData, 0)
 
-	newSDsMap := ConvertSDListToMap(newSDs)
-	prevSDsMap := ConvertSDListToMap(prevSDs)
+	if len(prevSDs) == 0 {
+		added = make([]SendableData, 0, len(newSDs))
+		for _, item := range newSDs {
+			copy := item.Copy()
+			copy.SetFlag(FLAG_ADDED)
+			added = append(added, copy)
+		}
+		return added, removed, unchanged
+	}
+	if len(newSDs) == 0 {
+		removed = make([]SendableData, 0, len(prevSDs))
+		for _, item := range prevSDs {
+			copy := item.Copy()
+			copy.SetFlag(FLAG_REMOVED)
+			removed = append(removed, copy)
+		}
+		return added, removed, unchanged
+	}
+
+	const (
+		inPrevious = 1 << iota
+		inNew
+	)
+	index := newSendableDataIndex(prevSDs)
+	for _, item := range prevSDs {
+		index.set(item, inPrevious)
+	}
 
 	for _, item := range newSDs {
-		_, exists := prevSDsMap[item.HashKey()]
-		if !exists {
+		membership, _ := index.get(item)
+		if membership&inPrevious == 0 {
 			rcopy := item.Copy()
 			rcopy.SetFlag(FLAG_ADDED)
 			added = append(added, rcopy)
 		}
+		index.add(item, inNew)
 	}
 	for _, item := range prevSDs {
-		_, exists := newSDsMap[item.HashKey()]
-		if !exists {
+		membership, _ := index.get(item)
+		if membership&inNew == 0 {
 			rcopy := item.Copy()
 			rcopy.SetFlag(FLAG_REMOVED)
 			removed = append(removed, rcopy)
@@ -268,11 +373,11 @@ func ComputeDiff(newSDs, prevSDs []SendableData, populateUnchanged bool) (added,
 
 func ApplyDiff(diff, prevSDs []SendableData) []SendableData {
 	newSDs := make([]SendableData, 0)
-	diffMap := ConvertSDListToMap(diff)
-	prevSDsMap := ConvertSDListToMap(prevSDs)
+	diffMap := newSendableDataIndex(diff)
+	prevSDsMap := newSendableDataIndex(prevSDs)
 
 	for _, item := range prevSDs {
-		_, exists := diffMap[item.HashKey()]
+		_, exists := diffMap.get(item)
 		if !exists {
 			rcopy := item.Copy()
 			newSDs = append(newSDs, rcopy)
@@ -283,7 +388,7 @@ func ApplyDiff(diff, prevSDs []SendableData) []SendableData {
 			rcopy := item.Copy()
 			newSDs = append(newSDs, rcopy)
 		} else if item.GetFlag() == FLAG_REMOVED {
-			citem, exists := prevSDsMap[item.HashKey()]
+			citem, exists := prevSDsMap.get(item)
 			if !exists {
 				rcopy := item.Copy()
 				newSDs = append(newSDs, rcopy)
@@ -297,6 +402,54 @@ func ApplyDiff(diff, prevSDs []SendableData) []SendableData {
 
 	}
 	return newSDs
+}
+
+// applyDiffToCurrent updates the full current set while sharing unchanged,
+// immutable entries. A refresh normally changes only a handful of entries, so
+// copying every VRP and building a second million-entry index is unnecessary.
+func applyDiffToCurrent(diff, current []SendableData, copyAdded bool) []SendableData {
+	added := 0
+	removed := 0
+	for _, item := range diff {
+		switch item.GetFlag() {
+		case FLAG_ADDED:
+			added++
+		case FLAG_REMOVED:
+			removed++
+		}
+	}
+	capacity := len(current) + added - removed
+	if capacity < 0 {
+		capacity = 0
+	}
+	updated := make([]SendableData, 0, capacity)
+	if len(current) == 0 {
+		for _, item := range diff {
+			if item.GetFlag() == FLAG_ADDED {
+				if copyAdded {
+					item = item.Copy()
+				}
+				updated = append(updated, item)
+			}
+		}
+		return updated
+	}
+
+	diffMap := newSendableDataIndex(diff)
+	for _, item := range current {
+		if _, changed := diffMap.get(item); !changed {
+			updated = append(updated, item)
+		}
+	}
+	for _, item := range diff {
+		if item.GetFlag() == FLAG_ADDED {
+			if copyAdded {
+				item = item.Copy()
+			}
+			updated = append(updated, item)
+		}
+	}
+	return updated
 }
 
 func (s *Server) GetSessionId(version uint8) uint16 {
@@ -381,20 +534,26 @@ func (s *Server) AddData(new []SendableData) bool {
 
 func (s *Server) AddSDsDiff(diff []SendableData) {
 	s.sdlock.RLock()
-	nextDiff := make([][]SendableData, len(s.sdListDiff)+1)
-	for i, prevSDs := range s.sdListDiff {
-		nextDiff[i] = ApplyDiff(diff, prevSDs)
+	hasPreviousVersion := len(s.sdCurrent) > 0 || s.sdCurrentSerial != 0 || len(s.sdListDiff) > 0
+	var nextDiff [][]SendableData
+	if hasPreviousVersion {
+		nextDiff = make([][]SendableData, len(s.sdListDiff), len(s.sdListDiff)+1)
+		for i, prevSDs := range s.sdListDiff {
+			nextDiff[i] = ApplyDiff(diff, prevSDs)
+		}
 	}
-	newSDCurrent := ApplyDiff(diff, s.sdCurrent)
+	newSDCurrent := applyDiffToCurrent(diff, s.sdCurrent, hasPreviousVersion)
 	s.sdlock.RUnlock()
 
 	s.sdlock.Lock()
 	defer s.sdlock.Unlock()
 	newserial := s.generateSerial()
 
-	nextDiff = append(nextDiff, diff)
-	if s.keepDiff > 0 && len(nextDiff) > s.keepDiff {
-		nextDiff = nextDiff[len(nextDiff)-s.keepDiff:]
+	if hasPreviousVersion {
+		nextDiff = append(nextDiff, diff)
+		if s.keepDiff > 0 && len(nextDiff) > s.keepDiff {
+			nextDiff = nextDiff[len(nextDiff)-s.keepDiff:]
+		}
 	}
 
 	s.sdListDiff = nextDiff

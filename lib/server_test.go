@@ -24,24 +24,44 @@ func GenerateVrps(size uint32, offset uint32) []SendableData {
 	return vrps
 }
 
-func BaseBench(base int, multiplier int) {
+func BaseBench(b *testing.B, base int, multiplier int) {
 	benchSize1 := base * multiplier
 	newVrps := GenerateVrps(uint32(benchSize1), uint32(0))
 	benchSize2 := base
 	prevVrps := GenerateVrps(uint32(benchSize2), uint32(benchSize1-benchSize2/2))
-	ComputeDiff(newVrps, prevVrps, false)
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		ComputeDiff(newVrps, prevVrps, false)
+	}
 }
 
 func BenchmarkComputeDiff1000x10(b *testing.B) {
-	BaseBench(1000, 10)
+	BaseBench(b, 1000, 10)
 }
 
 func BenchmarkComputeDiff10000x10(b *testing.B) {
-	BaseBench(10000, 10)
+	BaseBench(b, 10000, 10)
 }
 
 func BenchmarkComputeDiff100000x1(b *testing.B) {
-	BaseBench(100000, 1)
+	BaseBench(b, 100000, 1)
+}
+
+func BenchmarkServerUpdate100000(b *testing.B) {
+	first := GenerateVrps(100000, 0)
+	second := GenerateVrps(100000, 0)
+	second[len(second)-1].(*VRP).ASN++
+	server := NewServer(ServerConfiguration{KeepDifference: 3}, nil, nil)
+	server.AddData(first)
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if i%2 == 0 {
+			server.AddData(second)
+		} else {
+			server.AddData(first)
+		}
+	}
 }
 
 func TestComputeDiff(t *testing.T) {
@@ -175,6 +195,52 @@ func TestApplyDiff(t *testing.T) {
 	assert.Equal(t, vrps[4].(*VRP).GetFlag(), uint8(FLAG_REMOVED))
 	assert.Equal(t, vrps[5].(*VRP).ASN, uint32(65007))
 	assert.Equal(t, vrps[5].(*VRP).GetFlag(), uint8(FLAG_ADDED))
+}
+
+func TestServerDoesNotRetainInitialDataAsDiff(t *testing.T) {
+	server := NewServer(ServerConfiguration{KeepDifference: 3}, nil, nil)
+	initial := GenerateVrps(3, 0)
+	if !server.AddData(initial) {
+		t.Fatal("initial AddData reported no change")
+	}
+	if got := len(server.sdListDiff); got != 0 {
+		t.Fatalf("initial update retained %d serial diffs, want 0", got)
+	}
+	if got := len(server.sdCurrent); got != len(initial) {
+		t.Fatalf("current data has %d entries, want %d", got, len(initial))
+	}
+	for i := range initial {
+		if server.sdCurrent[i] == initial[i] {
+			t.Fatalf("current data entry %d aliases caller-owned input", i)
+		}
+	}
+
+	unchanged := server.sdCurrent[0]
+	updated := GenerateVrps(3, 0)
+	updated[2] = &VRP{
+		Prefix: netip.MustParsePrefix("fd00::4/128"),
+		MaxLen: 128,
+		ASN:    64496,
+	}
+	if !server.AddData(updated) {
+		t.Fatal("second AddData reported no change")
+	}
+	if got := len(server.sdListDiff); got != 1 {
+		t.Fatalf("second update retained %d serial diffs, want 1", got)
+	}
+	if server.sdCurrent[0] != unchanged {
+		t.Fatal("second update copied an unchanged current entry")
+	}
+	for _, diffItem := range server.sdListDiff[0] {
+		if diffItem.GetFlag() != FLAG_ADDED {
+			continue
+		}
+		for _, currentItem := range server.sdCurrent {
+			if currentItem.Equals(diffItem) && currentItem == diffItem {
+				t.Fatal("current data aliases a retained serial diff")
+			}
+		}
+	}
 }
 
 func TestComputeDiffBGPSEC(t *testing.T) {
