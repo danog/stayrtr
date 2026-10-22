@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"crypto/sha256"
 	"crypto/tls"
@@ -10,6 +11,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"net/http"
 	"net/netip"
 	"os"
@@ -287,6 +289,7 @@ func (s *state) updateFromNewState() error {
 	if vrpsjson == nil {
 		return nil
 	}
+	defer s.releaseSourceData()
 	bgpsecjson := s.lastdata.BgpSecKeys
 	if bgpsecjson == nil {
 		bgpsecjson = make([]prefixfile.BgpSecKeyJson, 0)
@@ -368,29 +371,31 @@ func (s *state) applyUpdateFromNewState(vrps []rtr.VRP, brks []rtr.BgpsecKey,
 	for _, v := range brks {
 		SDs = append(SDs, v.Copy())
 	}
-	if !s.server.AddData(SDs) {
+	changed := s.server.AddData(SDs)
+	if !changed {
 		log.Info("No difference to current cache")
-		return nil
+	} else {
+		serial, _ := s.server.GetCurrentSerial()
+		log.Infof("Update added, new serial %v", serial)
+		if s.sendNotifs {
+			log.Debugf("Sending notifications to clients")
+			s.server.NotifyClientsLatest()
+		}
+		server_metrics.CurrentSerial.Set(float64(serial))
 	}
 
-	serial, _ := s.server.GetCurrentSerial()
-	log.Infof("Update added, new serial %v", serial)
-	if s.sendNotifs {
-		log.Debugf("Sending notifications to clients")
-		s.server.NotifyClientsLatest()
+	if s.exportEnabled {
+		s.lockJson.Lock()
+		s.exported = prefixfile.RPKIList{
+			Metadata: prefixfile.MetaData{
+				Counts:    len(vrpsjson),
+				Buildtime: s.lastdata.Metadata.Buildtime,
+			},
+			ROA:        vrpsjson,
+			BgpSecKeys: brksjson,
+		}
+		s.lockJson.Unlock()
 	}
-	server_metrics.CurrentSerial.Set(float64(serial))
-
-	s.lockJson.Lock()
-	s.exported = prefixfile.RPKIList{
-		Metadata: prefixfile.MetaData{
-			Counts:    len(vrpsjson),
-			Buildtime: s.lastdata.Metadata.Buildtime,
-		},
-		ROA:        vrpsjson,
-		BgpSecKeys: brksjson,
-	}
-	s.lockJson.Unlock()
 
 	if s.metricsEvent != nil {
 		var countv4_dup int
@@ -406,6 +411,16 @@ func (s *state) applyUpdateFromNewState(vrps []rtr.VRP, brks []rtr.BgpsecKey,
 	}
 
 	return nil
+}
+
+// releaseSourceData drops the decoded JSON once the compact RTR state has been
+// built. Raw source data is only needed for JSON export or future SLURM reloads.
+func (s *state) releaseSourceData() {
+	if s.retainSourceData || s.lastdata == nil {
+		return
+	}
+	s.lastdata.ROA = nil
+	s.lastdata.BgpSecKeys = nil
 }
 
 func (s *state) updateFile(file string) (bool, error) {
@@ -489,7 +504,7 @@ func (s *state) updateDelay(delay *time.Ticker, interval int) {
 func (s *state) errRPKIJsonFileTooOldHandler() {
 	// If the exiting build time is over 24 hours, It's time to drop everything out.
 	// to avoid routing on stale data
-	buildTime := s.exported.Metadata.GetBuildTime()
+	buildTime := s.lastdata.Metadata.GetBuildTime()
 	if !buildTime.IsZero() && time.Since(buildTime) > time.Hour*24 {
 		log.Errorf("Data is stale, clearing it all.")
 		s.server.AddData([]rtr.SendableData{}) // empty the store of sendable stuff, triggering a emptying of the RTR server
@@ -590,8 +605,74 @@ func (s *state) exporter(wr http.ResponseWriter, r *http.Request) {
 	s.lockJson.RLock()
 	toExport := s.exported
 	s.lockJson.RUnlock()
-	enc := json.NewEncoder(wr)
-	enc.Encode(toExport)
+
+	wr.Header().Set("Content-Type", "application/json")
+	buf := bufio.NewWriterSize(wr, 64*1024)
+	if err := writeRPKIList(buf, &toExport); err != nil {
+		log.Errorf("Could not export RPKI JSON: %v", err)
+		return
+	}
+	if err := buf.Flush(); err != nil {
+		log.Errorf("Could not flush RPKI JSON: %v", err)
+	}
+}
+
+const exportChunkSize = 1024
+
+func writeRPKIList(w io.Writer, list *prefixfile.RPKIList) error {
+	metadata, err := json.Marshal(list.Metadata)
+	if err != nil {
+		return err
+	}
+	if _, err := io.WriteString(w, `{"metadata":`); err != nil {
+		return err
+	}
+	if _, err := w.Write(metadata); err != nil {
+		return err
+	}
+	if _, err := io.WriteString(w, `,"roas":`); err != nil {
+		return err
+	}
+	if err := writeJSONArrayChunks(w, list.ROA); err != nil {
+		return err
+	}
+	if len(list.BgpSecKeys) > 0 {
+		if _, err := io.WriteString(w, `,"bgpsec_keys":`); err != nil {
+			return err
+		}
+		if err := writeJSONArrayChunks(w, list.BgpSecKeys); err != nil {
+			return err
+		}
+	}
+	_, err = io.WriteString(w, "}\n")
+	return err
+}
+
+func writeJSONArrayChunks[T any](w io.Writer, values []T) error {
+	if values == nil {
+		_, err := io.WriteString(w, "null")
+		return err
+	}
+	if _, err := io.WriteString(w, "["); err != nil {
+		return err
+	}
+	for start := 0; start < len(values); start += exportChunkSize {
+		end := min(start+exportChunkSize, len(values))
+		chunk, err := json.Marshal(values[start:end])
+		if err != nil {
+			return err
+		}
+		if start > 0 {
+			if _, err := io.WriteString(w, ","); err != nil {
+				return err
+			}
+		}
+		if _, err := w.Write(chunk[1 : len(chunk)-1]); err != nil {
+			return err
+		}
+	}
+	_, err := io.WriteString(w, "]")
+	return err
 }
 
 func (s *state) updateNow(wr http.ResponseWriter, r *http.Request) {
@@ -636,8 +717,10 @@ type state struct {
 
 	metricsEvent *metricsEvent
 
-	exported prefixfile.RPKIList
-	lockJson *sync.RWMutex
+	exported         prefixfile.RPKIList
+	lockJson         *sync.RWMutex
+	exportEnabled    bool
+	retainSourceData bool
 
 	slurm *prefixfile.SlurmConfig
 
@@ -742,12 +825,14 @@ func run() error {
 	deh.SetSDManager(server)
 
 	s := state{
-		server:       server,
-		lastdata:     &prefixfile.RPKIList{},
-		metricsEvent: me,
-		sendNotifs:   *SendNotifs,
-		checktime:    *TimeCheck,
-		lockJson:     &sync.RWMutex{},
+		server:           server,
+		lastdata:         &prefixfile.RPKIList{},
+		metricsEvent:     me,
+		sendNotifs:       *SendNotifs,
+		checktime:        *TimeCheck,
+		lockJson:         &sync.RWMutex{},
+		exportEnabled:    *ExportPath != "",
+		retainSourceData: *ExportPath != "" || (*Slurm != "" && *SlurmRefresh),
 
 		fetchConfig: utils.NewFetchConfig(),
 

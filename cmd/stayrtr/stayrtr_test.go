@@ -1,9 +1,13 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"net/netip"
 	"os"
+	"sync"
 	"testing"
 	"time"
 
@@ -210,5 +214,77 @@ func TestNewSHA256(t *testing.T) {
 	got := fmt.Sprintf("%x", newSHA256([]byte("☘️")))
 	if got != want {
 		t.Errorf("Got (%s), Wanted (%s)", got, want)
+	}
+}
+
+func TestExporter(t *testing.T) {
+	want := prefixfile.RPKIList{
+		Metadata: prefixfile.MetaData{Counts: 2, Serial: 42},
+		ROA: []prefixfile.VRPJson{
+			{Prefix: "192.0.2.0/24", Length: 24, ASN: float64(64496), TA: "test"},
+			{Prefix: "2001:db8::/32", Length: 48, ASN: "AS64497", TA: "test"},
+		},
+		BgpSecKeys: []prefixfile.BgpSecKeyJson{
+			{Asn: 64496, Pubkey: []byte("key"), Ski: "abcd"},
+		},
+	}
+	s := state{exported: want, lockJson: &sync.RWMutex{}}
+	res := httptest.NewRecorder()
+	s.exporter(res, httptest.NewRequest(http.MethodGet, "/rpki.json", nil))
+
+	if got := res.Header().Get("Content-Type"); got != "application/json" {
+		t.Fatalf("got Content-Type %q, want application/json", got)
+	}
+	var got prefixfile.RPKIList
+	if err := json.Unmarshal(res.Body.Bytes(), &got); err != nil {
+		t.Fatalf("exported invalid JSON: %v", err)
+	}
+	if !cmp.Equal(got, want) {
+		t.Fatalf("unexpected export (-want +got):\n%s", cmp.Diff(want, got))
+	}
+}
+
+func TestUnchangedUpdateRefreshesExport(t *testing.T) {
+	server := rtr.NewServer(rtr.ServerConfiguration{KeepDifference: 3}, nil, nil)
+	s := state{
+		server:           server,
+		lastdata:         &prefixfile.RPKIList{Metadata: prefixfile.MetaData{Buildtime: "first"}},
+		lockJson:         &sync.RWMutex{},
+		exportEnabled:    true,
+		retainSourceData: true,
+	}
+	vrps := []rtr.VRP{{Prefix: netip.MustParsePrefix("192.0.2.0/24"), MaxLen: 24, ASN: 64496}}
+	first := []prefixfile.VRPJson{{Prefix: "192.0.2.0/24", Length: 24, ASN: 64496, TA: "first"}}
+	if err := s.applyUpdateFromNewState(vrps, nil, first, nil, 1, 0); err != nil {
+		t.Fatal(err)
+	}
+
+	s.lastdata = &prefixfile.RPKIList{Metadata: prefixfile.MetaData{Buildtime: "second"}}
+	second := []prefixfile.VRPJson{{Prefix: "192.0.2.0/24", Length: 24, ASN: 64496, TA: "second"}}
+	if err := s.applyUpdateFromNewState(vrps, nil, second, nil, 1, 0); err != nil {
+		t.Fatal(err)
+	}
+
+	if s.exported.Metadata.Buildtime != "second" || s.exported.ROA[0].TA != "second" {
+		t.Fatalf("unchanged RTR update left stale export: %+v", s.exported)
+	}
+}
+
+func TestUpdateReleasesSourceDataWhenUnused(t *testing.T) {
+	server := rtr.NewServer(rtr.ServerConfiguration{KeepDifference: 3}, nil, nil)
+	s := state{
+		server:   server,
+		lastdata: &prefixfile.RPKIList{ROA: []prefixfile.VRPJson{{Prefix: "192.0.2.0/24", Length: 24, ASN: 64496}}},
+		lockJson: &sync.RWMutex{},
+	}
+
+	if err := s.updateFromNewState(); err != nil {
+		t.Fatal(err)
+	}
+	if s.lastdata.ROA != nil || s.lastdata.BgpSecKeys != nil {
+		t.Fatal("decoded source data was retained with export and SLURM disabled")
+	}
+	if got := server.CountSDs(); got != 1 {
+		t.Fatalf("RTR state contains %d objects, want 1", got)
 	}
 }
