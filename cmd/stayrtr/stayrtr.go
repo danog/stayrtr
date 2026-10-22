@@ -276,6 +276,27 @@ func (e IdenticalFile) Error() string {
 
 var errRPKIJsonFileTooOld = errors.New("RPKI JSON file is older than 24 hours")
 
+// checkBuildTime enforces the 24 hour staleness check on the given metadata
+// when enabled via -checktime.
+func (s *state) checkBuildTime(metadata prefixfile.MetaData) error {
+	buildtime, err := time.Parse(time.RFC3339, metadata.Buildtime)
+	if metadata.GeneratedUnix != nil {
+		buildtime, err = time.Unix(*metadata.GeneratedUnix, 0), nil
+	}
+	if !s.checktime {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	notafter := buildtime.Add(time.Hour * 24)
+	if time.Now().UTC().After(notafter) {
+		log.Warnf("RPKI JSON file is older than 24 hours: %v", buildtime)
+		return errRPKIJsonFileTooOld
+	}
+	return nil
+}
+
 // Update the state based on the current slurm file and data.
 func (s *state) updateFromNewState() error {
 	vrpsjson := s.lastdata.ROA
@@ -288,19 +309,8 @@ func (s *state) updateFromNewState() error {
 		bgpsecjson = make([]prefixfile.BgpSecKeyJson, 0)
 	}
 
-	buildtime, err := time.Parse(time.RFC3339, s.lastdata.Metadata.Buildtime)
-	if s.lastdata.Metadata.GeneratedUnix != nil {
-		buildtime, err = time.Unix(*s.lastdata.Metadata.GeneratedUnix, 0), nil
-	}
-	if s.checktime {
-		if err != nil {
-			return err
-		}
-		notafter := buildtime.Add(time.Hour * 24)
-		if time.Now().UTC().After(notafter) {
-			log.Warnf("RPKI JSON file is older than 24 hours: %v", buildtime)
-			return errRPKIJsonFileTooOld
-		}
+	if err := s.checkBuildTime(s.lastdata.Metadata); err != nil {
+		return err
 	}
 
 	if s.slurm != nil {
@@ -318,6 +328,11 @@ func (s *state) updateFromNewState() error {
 func (s *state) reloadFromCurrentState() error {
 	vrpsjson := s.lastdata.ROA
 	if vrpsjson == nil {
+		if s.sourceReleased {
+			// The source data was released once applied, so there is nothing
+			// to reprocess, but the data still being served can go stale.
+			return s.checkBuildTime(s.lastdata.Metadata)
+		}
 		return nil
 	}
 	bgpsecjson := s.lastdata.BgpSecKeys
@@ -325,19 +340,8 @@ func (s *state) reloadFromCurrentState() error {
 		bgpsecjson = make([]prefixfile.BgpSecKeyJson, 0)
 	}
 
-	buildtime, err := time.Parse(time.RFC3339, s.lastdata.Metadata.Buildtime)
-	if s.lastdata.Metadata.GeneratedUnix != nil {
-		buildtime, err = time.Unix(*s.lastdata.Metadata.GeneratedUnix, 0), nil
-	}
-	if s.checktime {
-		if err != nil {
-			return err
-		}
-		notafter := buildtime.Add(time.Hour * 24)
-		if time.Now().UTC().After(notafter) {
-			log.Warnf("RPKI JSON file is older than 24 hours: %v", buildtime)
-			return errRPKIJsonFileTooOld
-		}
+	if err := s.checkBuildTime(s.lastdata.Metadata); err != nil {
+		return err
 	}
 
 	if s.slurm != nil {
@@ -414,6 +418,7 @@ func (s *state) releaseSourceData() {
 	}
 	s.lastdata.ROA = nil
 	s.lastdata.BgpSecKeys = nil
+	s.sourceReleased = true
 }
 
 func (s *state) updateFile(file string) (bool, error) {
@@ -449,6 +454,7 @@ func (s *state) updateFile(file string) (bool, error) {
 
 	s.lastchange = time.Now().UTC()
 	s.lastdata = rpkilistjson
+	s.sourceReleased = false
 
 	return true, nil
 }
@@ -714,6 +720,9 @@ type state struct {
 	lockJson         *sync.RWMutex
 	exportEnabled    bool
 	retainSourceData bool
+	// sourceReleased reports that lastdata's raw source data was dropped
+	// after being applied; only its metadata is left.
+	sourceReleased bool
 
 	slurm *prefixfile.SlurmConfig
 
