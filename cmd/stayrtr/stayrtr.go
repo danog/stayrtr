@@ -355,11 +355,11 @@ func (s *state) applyUpdateFromNewState(vrps []rtr.VRP, brks []rtr.BgpsecKey,
 	countv4 int, countv6 int) error {
 
 	SDs := make([]rtr.SendableData, 0, len(vrps)+len(brks))
-	for _, v := range vrps {
-		SDs = append(SDs, v.Copy())
+	for i := range vrps {
+		SDs = append(SDs, &vrps[i])
 	}
-	for _, v := range brks {
-		SDs = append(SDs, v.Copy())
+	for i := range brks {
+		SDs = append(SDs, &brks[i])
 	}
 	if !s.server.AddData(SDs) {
 		log.Info("No difference to current cache")
