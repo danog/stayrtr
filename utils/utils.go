@@ -1,6 +1,7 @@
 package utils
 
 import (
+	"bytes"
 	"fmt"
 	"io"
 	"net"
@@ -228,10 +229,22 @@ func (c *FetchConfig) FetchFile(file string) ([]byte, int, bool, error) {
 	return data, code, lastrefresh, nil
 }
 
+// maxSizeHintPrealloc caps how much memory a size hint may reserve up front.
+// An HTTP Content-Length comes from the remote server, so a bogus value must
+// not be able to force a huge allocation before any data has arrived.
+const maxSizeHintPrealloc = 64 << 20
+
 func readAllWithSizeHint(r io.Reader, sizeHint int64) ([]byte, error) {
-	maxInt := uint64(^uint(0) >> 1)
-	if sizeHint <= 0 || uint64(sizeHint) > maxInt {
+	if sizeHint <= 0 {
 		return io.ReadAll(r)
+	}
+	if sizeHint > maxSizeHintPrealloc {
+		// Too large to trust: reserve the cap and grow only as data arrives.
+		buf := bytes.NewBuffer(make([]byte, 0, maxSizeHintPrealloc))
+		if _, err := buf.ReadFrom(r); err != nil {
+			return nil, err
+		}
+		return buf.Bytes(), nil
 	}
 
 	data := make([]byte, int(sizeHint))
