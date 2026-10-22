@@ -23,6 +23,7 @@ func TestReadAllWithSizeHint(t *testing.T) {
 		{name: "unknown", input: "abcdef", sizeHint: -1},
 		{name: "empty", input: "", sizeHint: 0},
 		{name: "short", input: "abc", sizeHint: 6, wantErr: io.ErrUnexpectedEOF},
+		{name: "bogus huge hint", input: "abcdef", sizeHint: 1 << 50},
 	}
 
 	for _, tt := range tests {
