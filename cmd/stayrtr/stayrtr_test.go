@@ -436,3 +436,32 @@ func TestUpdateFileRetainsJSONForExport(t *testing.T) {
 		t.Fatalf("RTR state contains %d objects, want 1", got)
 	}
 }
+
+func TestReleasedSourceDataStillGoesStale(t *testing.T) {
+	server := rtr.NewServer(rtr.ServerConfiguration{KeepDifference: 3}, nil, nil)
+	s := state{
+		server:    server,
+		checktime: true,
+		lastdata: &prefixfile.RPKIList{
+			Metadata: prefixfile.MetaData{Buildtime: time.Now().UTC().Format(time.RFC3339)},
+			ROA:      []prefixfile.VRPJson{{Prefix: "192.0.2.0/24", Length: 24, ASN: 64496}},
+		},
+		lockJson: &sync.RWMutex{},
+	}
+
+	if err := s.updateFromNewState(); err != nil {
+		t.Fatal(err)
+	}
+	if s.lastdata.ROA != nil {
+		t.Fatal("decoded source data was retained with export and SLURM disabled")
+	}
+	if err := s.reloadFromCurrentState(); err != nil {
+		t.Fatalf("fresh data reported as stale: %v", err)
+	}
+
+	// The cache stops updating: the data being served must still go stale.
+	s.lastdata.Metadata.Buildtime = time.Now().UTC().Add(-25 * time.Hour).Format(time.RFC3339)
+	if err := s.reloadFromCurrentState(); err != errRPKIJsonFileTooOld {
+		t.Fatalf("got %v, want errRPKIJsonFileTooOld", err)
+	}
+}

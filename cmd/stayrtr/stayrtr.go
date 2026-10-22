@@ -516,6 +516,11 @@ func (s *state) updateFromNewState() error {
 func (s *state) reloadFromCurrentState() error {
 	vrpsjson := s.lastdata.ROA
 	if vrpsjson == nil {
+		if s.sourceReleased {
+			// The source data was released once applied, so there is nothing
+			// to reprocess, but the data still being served can go stale.
+			return s.checkBuildTime(s.lastdata.Metadata)
+		}
 		return nil
 	}
 	bgpsecjson := s.lastdata.BgpSecKeys
@@ -601,6 +606,7 @@ func (s *state) releaseSourceData() {
 	}
 	s.lastdata.ROA = nil
 	s.lastdata.BgpSecKeys = nil
+	s.sourceReleased = true
 }
 
 func (s *state) updateFile(file string) (bool, error) {
@@ -643,6 +649,7 @@ func (s *state) updateFile(file string) (bool, error) {
 
 	s.lastchange = time.Now().UTC()
 	s.lastdata = &prefixfile.RPKIList{Metadata: updt.metadata}
+	s.sourceReleased = false
 	if retain {
 		if updt.roasSeen {
 			s.lastdata.ROA = updt.vrpsjson
@@ -922,6 +929,9 @@ type state struct {
 	lockJson         *sync.RWMutex
 	exportEnabled    bool
 	retainSourceData bool
+	// sourceReleased reports that lastdata's raw source data was dropped
+	// after being applied; only its metadata is left.
+	sourceReleased bool
 
 	slurm *prefixfile.SlurmConfig
 
