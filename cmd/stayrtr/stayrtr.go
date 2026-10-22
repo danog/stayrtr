@@ -11,9 +11,11 @@ import (
 	"flag"
 	"fmt"
 	"net/http"
+	"net/http/pprof"
 	"net/netip"
 	"os"
 	"os/signal"
+	runtimepprof "runtime/pprof"
 	"sort"
 	"strings"
 	"sync"
@@ -52,6 +54,7 @@ var (
 
 	MetricsAddr = flag.String("metrics.addr", ":9847", "Metrics address")
 	MetricsPath = flag.String("metrics.path", "/metrics", "Metrics path")
+	EnablePprof = flag.Bool("pprof", false, "Enable pprof handlers under /debug/pprof/ on the metrics HTTP server")
 
 	ExportPath           = flag.String("export.path", "/rpki.json", "Export path")
 	EnableUpdateEndpoint = flag.Bool("update.endpoint", false, "Enable HTTP endpoint that expedites the next fetch")
@@ -115,6 +118,19 @@ func serveHTTP(mux *http.ServeMux) {
 		Handler: mux,
 	}
 	log.Fatal(srv.ListenAndServe())
+}
+
+func registerPprofHandlers(mux *http.ServeMux) {
+	mux.HandleFunc("GET /debug/pprof/", pprof.Index)
+	mux.HandleFunc("GET /debug/pprof/cmdline", pprof.Cmdline)
+	mux.HandleFunc("GET /debug/pprof/profile", pprof.Profile)
+	mux.HandleFunc("GET /debug/pprof/symbol", pprof.Symbol)
+	mux.HandleFunc("POST /debug/pprof/symbol", pprof.Symbol)
+	mux.HandleFunc("GET /debug/pprof/trace", pprof.Trace)
+
+	for _, profile := range runtimepprof.Profiles() {
+		mux.Handle("GET /debug/pprof/"+profile.Name(), pprof.Handler(profile.Name()))
+	}
 }
 
 // newSHA256 will return the sha256 sum of the byte slice
@@ -759,6 +775,9 @@ func run() error {
 		mux := http.NewServeMux()
 		mux.Handle(*MetricsPath, promhttp.Handler())
 		mux.HandleFunc("GET /clients", server.GetClientRemoteAddrs)
+		if *EnablePprof {
+			registerPprofHandlers(mux)
+		}
 
 		if *ExportPath != "" {
 			mux.HandleFunc(*ExportPath, s.exporter)

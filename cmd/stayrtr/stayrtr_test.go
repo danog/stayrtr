@@ -2,6 +2,8 @@ package main
 
 import (
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"net/netip"
 	"os"
 	"testing"
@@ -189,5 +191,19 @@ func TestNewSHA256(t *testing.T) {
 	got := fmt.Sprintf("%x", newSHA256([]byte("☘️")))
 	if got != want {
 		t.Errorf("Got (%s), Wanted (%s)", got, want)
+	}
+}
+
+func TestRegisterPprofHandlers(t *testing.T) {
+	mux := http.NewServeMux()
+	registerPprofHandlers(mux)
+
+	for _, path := range []string{"/debug/pprof/", "/debug/pprof/heap"} {
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		res := httptest.NewRecorder()
+		mux.ServeHTTP(res, req)
+		if res.Code != http.StatusOK {
+			t.Errorf("GET %s: got status %d, want %d", path, res.Code, http.StatusOK)
+		}
 	}
 }
