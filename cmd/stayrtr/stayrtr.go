@@ -184,7 +184,7 @@ func decodeJSONStream(r io.Reader, sizeHint int64, retain bool) (*streamedUpdate
 			}
 		case "roas":
 			updt.roasSeen = true
-			if count := updt.metadata.Counts; count > 0 && count <= preallocLimit(sizeHint) {
+			if count := min(updt.metadata.Counts, preallocLimit(sizeHint)); count > 0 {
 				updt.vrps = make([]rtr.VRP, 0, count)
 				if retain {
 					updt.vrpsjson = make([]prefixfile.VRPJson, 0, count)
@@ -215,7 +215,7 @@ func decodeJSONStream(r io.Reader, sizeHint int64, retain bool) (*streamedUpdate
 			}
 		case "bgpsec_keys":
 			updt.bgpsecSeen = true
-			if count := updt.metadata.CountBgpSecKeys; count > 0 && count <= preallocLimit(sizeHint) && retain {
+			if count := min(updt.metadata.CountBgpSecKeys, preallocLimit(sizeHint)); count > 0 && retain {
 				updt.brksjson = make([]prefixfile.BgpSecKeyJson, 0, count)
 			}
 			if err := expectDelim(dec, '['); err != nil {
@@ -257,13 +257,18 @@ func decodeJSONStream(r io.Reader, sizeHint int64, retain bool) (*streamedUpdate
 	return updt, nil
 }
 
-// preallocLimit bounds a metadata count used for slice preallocation, so a
-// bogus count cannot trigger a huge allocation.
+// maxPrealloc caps slice preallocation from the metadata counts. The counts
+// and the size hint (an HTTP Content-Length) both come from the remote side,
+// so a bogus value must not force a huge allocation up front; slices for
+// larger documents simply grow on append.
+const maxPrealloc = 2 << 20
+
+// preallocLimit bounds a metadata count used for slice preallocation.
 func preallocLimit(sizeHint int64) int {
-	if sizeHint > 0 {
+	if sizeHint > 0 && sizeHint/32 < maxPrealloc {
 		return int(sizeHint/32) + 1024
 	}
-	return 8 << 20
+	return maxPrealloc
 }
 
 func expectDelim(dec *json.Decoder, want json.Delim) error {
@@ -478,6 +483,9 @@ func (s *state) updateFromNewState() error {
 	if s.pending != nil {
 		updt := s.pending
 		s.pending = nil
+		// Only the metadata is kept, which reloadFromCurrentState still uses
+		// to check for staleness.
+		s.sourceReleased = true
 		if err := s.checkBuildTime(updt.metadata); err != nil {
 			return err
 		}
@@ -627,8 +635,10 @@ func (s *state) updateFile(file string) (bool, error) {
 
 	// Raw JSON structures are only needed when the export endpoint or SLURM
 	// filtering consumes them; otherwise entries are converted to the compact
-	// RTR form while streaming and released immediately.
-	retain := s.exportEnabled || s.slurm != nil
+	// RTR form while streaming and released immediately. This depends on the
+	// configuration rather than on s.slurm, which the concurrent SLURM fetch
+	// may not have loaded yet.
+	retain := s.exportEnabled || s.slurmConfigured
 
 	hasher := sha256.New()
 	updt, err := decodeJSONStream(io.TeeReader(stream, hasher), stream.SizeHint, retain)
@@ -934,6 +944,9 @@ type state struct {
 	sourceReleased bool
 
 	slurm *prefixfile.SlurmConfig
+	// slurmConfigured reports that a SLURM file is configured, even before
+	// it has been loaded.
+	slurmConfigured bool
 
 	checktime bool
 
@@ -1044,6 +1057,7 @@ func run() error {
 		lockJson:         &sync.RWMutex{},
 		exportEnabled:    *ExportPath != "",
 		retainSourceData: *ExportPath != "" || (*Slurm != "" && *SlurmRefresh),
+		slurmConfigured:  *Slurm != "",
 
 		fetchConfig: utils.NewFetchConfig(),
 

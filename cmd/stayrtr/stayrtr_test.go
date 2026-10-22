@@ -9,6 +9,7 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -463,5 +464,94 @@ func TestReleasedSourceDataStillGoesStale(t *testing.T) {
 	s.lastdata.Metadata.Buildtime = time.Now().UTC().Add(-25 * time.Hour).Format(time.RFC3339)
 	if err := s.reloadFromCurrentState(); err != errRPKIJsonFileTooOld {
 		t.Fatalf("got %v, want errRPKIJsonFileTooOld", err)
+	}
+}
+
+func TestUpdateFileAppliesSlurmLoadedAfterCache(t *testing.T) {
+	dir := t.TempDir()
+	doc := `{"metadata":{"vrps":2},"roas":[
+		{"prefix":"192.0.2.0/24","maxLength":24,"asn":"AS64496"},
+		{"prefix":"2001:db8::/32","maxLength":48,"asn":"AS64497"}]}`
+	cache := filepath.Join(dir, "cache.json")
+	if err := os.WriteFile(cache, []byte(doc), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	server := rtr.NewServer(rtr.ServerConfiguration{KeepDifference: 3}, nil, nil)
+	s := state{
+		server:          server,
+		lastdata:        &prefixfile.RPKIList{},
+		lockJson:        &sync.RWMutex{},
+		slurmConfigured: true,
+		fetchConfig:     utils.NewFetchConfig(),
+	}
+
+	// The cache and SLURM files are fetched concurrently, so the cache can
+	// finish decoding before the SLURM file has been loaded.
+	if updated, err := s.updateFile(cache); err != nil || !updated {
+		t.Fatalf("updateFile: updated=%v err=%v", updated, err)
+	}
+	if s.pending != nil {
+		t.Fatal("configured SLURM file produced a pending update that bypasses it")
+	}
+	s.slurm = &prefixfile.SlurmConfig{
+		ValidationOutputFilters: prefixfile.SlurmValidationOutputFilters{
+			PrefixFilters: []prefixfile.SlurmPrefixFilter{{Prefix: "192.0.2.0/24"}},
+		},
+	}
+	if err := s.updateFromNewState(); err != nil {
+		t.Fatal(err)
+	}
+	if got := server.CountSDs(); got != 1 {
+		t.Fatalf("RTR state contains %d objects, want 1 after SLURM filtering", got)
+	}
+}
+
+func TestStreamedUpdateStillGoesStale(t *testing.T) {
+	dir := t.TempDir()
+	doc := fmt.Sprintf(`{"metadata":{"vrps":1,"buildtime":%q},"roas":[
+		{"prefix":"192.0.2.0/24","maxLength":24,"asn":"AS64496"}]}`, time.Now().UTC().Format(time.RFC3339))
+	cache := filepath.Join(dir, "cache.json")
+	if err := os.WriteFile(cache, []byte(doc), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	server := rtr.NewServer(rtr.ServerConfiguration{KeepDifference: 3}, nil, nil)
+	s := state{
+		server:      server,
+		checktime:   true,
+		lastdata:    &prefixfile.RPKIList{},
+		lockJson:    &sync.RWMutex{},
+		fetchConfig: utils.NewFetchConfig(),
+	}
+
+	if updated, err := s.updateFile(cache); err != nil || !updated {
+		t.Fatalf("updateFile: updated=%v err=%v", updated, err)
+	}
+	if err := s.updateFromNewState(); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.reloadFromCurrentState(); err != nil {
+		t.Fatalf("fresh data reported as stale: %v", err)
+	}
+
+	// The cache stops updating: the data being served must still go stale.
+	s.lastdata.Metadata.Buildtime = time.Now().UTC().Add(-25 * time.Hour).Format(time.RFC3339)
+	if err := s.reloadFromCurrentState(); err != errRPKIJsonFileTooOld {
+		t.Fatalf("got %v, want errRPKIJsonFileTooOld", err)
+	}
+}
+
+func TestDecodeJSONStreamCapsPreallocation(t *testing.T) {
+	doc := `{"metadata":{"vrps":1000000000,"bgpsec_pubkeys":1000000000},"roas":[],"bgpsec_keys":[]}`
+	for _, sizeHint := range []int64{-1, 1 << 50} {
+		got, err := decodeJSONStream(strings.NewReader(doc), sizeHint, true)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cap(got.vrps) > maxPrealloc || cap(got.vrpsjson) > maxPrealloc || cap(got.brksjson) > maxPrealloc {
+			t.Fatalf("size hint %d: bogus metadata counts preallocated vrps=%d vrpsjson=%d brksjson=%d",
+				sizeHint, cap(got.vrps), cap(got.vrpsjson), cap(got.brksjson))
+		}
 	}
 }
